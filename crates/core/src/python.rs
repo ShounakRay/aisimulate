@@ -926,6 +926,7 @@ struct AicTimingModel {
     decoder_replay: bool,
     phase_provider: AicPhaseProvider,
     use_fpm_decode_totals: bool,
+    fpm_power: bool,
     fpm_decode_kv_ceiling: Option<u32>,
     evidence: Mutex<TimingEvidenceAccumulator>,
     // Capture-only history. Keyed by phase, exact iteration totals and the
@@ -1035,6 +1036,10 @@ impl AicTimingModel {
             model: Arc::clone(&model),
             memo: Memo::clock(64),
         });
+        let fpm_power = use_fpm_decode_totals
+            && vision.is_none()
+            && config.speculation.is_none()
+            && native.supports_fpm_power()?;
         let phase_provider = AicPhaseProvider::Native(Arc::clone(&native));
         let iteration = IterationPricing::for_replay(
             &model,
@@ -1060,6 +1065,7 @@ impl AicTimingModel {
             decoder_replay: config.decoder_replay,
             phase_provider,
             use_fpm_decode_totals,
+            fpm_power,
             fpm_decode_kv_ceiling,
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
@@ -1123,6 +1129,7 @@ impl AicTimingModel {
             decoder_replay: false,
             phase_provider: AicPhaseProvider::Fitted(fitted),
             use_fpm_decode_totals: false,
+            fpm_power: false,
             fpm_decode_kv_ceiling: None,
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
@@ -1326,6 +1333,28 @@ impl AicTimingModel {
         evidence.record(phase, prefill)
     }
 
+    fn record_pass_evidence(&self, phases: &[(Arc<ValidatedTimingPhase>, bool)]) -> Result<()> {
+        if phases.is_empty() {
+            return Ok(());
+        }
+        let mut evidence = self
+            .evidence
+            .lock()
+            .map_err(|_| anyhow!("AIC timing evidence accumulator was poisoned"))?;
+        for (phase, prefill) in phases {
+            evidence.record(phase, *prefill)?;
+        }
+        Ok(())
+    }
+
+    fn fpm_evidence_model(&self) -> Option<&ForwardPassPerfModel> {
+        if self.fpm_power {
+            self.fpm_model.as_deref()
+        } else {
+            self.diagnostic_model.as_deref()
+        }
+    }
+
     fn record_fpm_estimate(
         &self,
         (phase, first, second, third): (FpmEvidencePhase, u32, u32, u32),
@@ -1334,6 +1363,12 @@ impl AicTimingModel {
         let latency_ms = estimate
             .latency_ms
             .context("native FPM returned no estimate")?;
+        if self.fpm_power {
+            self.record_pass_evidence(&fpm_rank_evidence(&estimate)?)?;
+        }
+        if self.diagnostic_model.is_none() {
+            return Ok(latency_ms);
+        }
         // Empty work runs no lookup. A mixed decode share can be zero after
         // real decode and baseline lookups, and those remain evidence.
         let looked_up_baseline = estimate
@@ -1457,7 +1492,7 @@ impl AicTimingModel {
             self.record_evidence(&evidence, true)?;
             return Ok(latency_ms);
         }
-        if let Some(model) = &self.diagnostic_model {
+        if let Some(model) = self.fpm_evidence_model() {
             return self.record_fpm_estimate(
                 (FpmEvidencePhase::Prefill, batch_size, mean_isl, mean_prefix),
                 corrected_estimate(
@@ -1578,7 +1613,7 @@ impl AicTimingModel {
         let model = &pricing.model;
         let metrics: Vec<_> = queries.iter().map(rank_metrics).collect();
         let whole_model = matches!(dispatch, IterationDispatch::WholeModel { .. });
-        if whole_model && !capture {
+        if whole_model && !capture && !self.fpm_power {
             let total_ms = model
                 .estimate_forward_pass_time_ms(&metrics)
                 .context("AIC iteration prediction failed")?
@@ -1612,10 +1647,15 @@ impl AicTimingModel {
             .latency_ms
             .context("canonical model returned no iteration estimate")?;
         if whole_model {
+            let evidence = if self.fpm_power {
+                fpm_rank_evidence(&estimate)?
+            } else {
+                Vec::new()
+            };
             return Ok(PricedIteration {
                 total_ms,
-                estimate: Some(estimate),
-                evidence: Vec::new(),
+                estimate: capture.then_some(estimate),
+                evidence,
             });
         }
         Ok(PricedIteration {
@@ -1916,9 +1956,7 @@ impl AicTimingModel {
     /// FPM estimate under the iteration's correction, as each rank recorded
     /// its own estimate when it priced its own phases.
     fn record_iteration(&self, priced: &PricedIteration, queries: &[RankQuery]) -> Result<()> {
-        for (phase, prefill) in &priced.evidence {
-            self.record_evidence(phase, *prefill)?;
-        }
+        self.record_pass_evidence(&priced.evidence)?;
         let Some(estimate) = priced
             .estimate
             .as_ref()
@@ -1980,6 +2018,78 @@ fn rank_estimate(
             ..rank.clone()
         }],
     }
+}
+
+/// Fold active rank evidence once when pricing, so a cached iteration
+/// records at most two components regardless of its attention-DP width.
+fn fpm_rank_evidence(
+    estimate: &crate::ForwardPassEstimate,
+) -> Result<Vec<(Arc<ValidatedTimingPhase>, bool)>> {
+    #[derive(Default)]
+    struct Totals {
+        covered_ms: f64,
+        uncovered_ms: f64,
+        energy_wms: f64,
+    }
+
+    let correction = estimate.correction_factor.unwrap_or(1.0);
+    let mut phases = [Totals::default(), Totals::default()];
+    for rank in &estimate.ranks {
+        let components = [
+            (rank.prefill_ms, rank.prefill_energy_wms),
+            (
+                rank.marginal_decode_ms.or(rank.decode_ms),
+                rank.decode_energy_wms,
+            ),
+        ];
+        for (phase, (latency, energy)) in phases.iter_mut().zip(components) {
+            if let Some(latency_ms) = latency.filter(|&ms| ms > 0.0) {
+                let latency_ms = latency_ms * correction;
+                if let Some(energy_wms) = energy
+                    .map(|value| value * correction)
+                    .filter(|&value| value != 0.0)
+                {
+                    phase.covered_ms += latency_ms;
+                    phase.energy_wms += energy_wms;
+                } else {
+                    phase.uncovered_ms += latency_ms;
+                }
+            }
+        }
+    }
+
+    let mut evidence = Vec::with_capacity(2);
+    for (phase, (prefill, name)) in phases
+        .into_iter()
+        .zip([(true, "fpm_prefill"), (false, "fpm_decode")])
+    {
+        let mut operations = Vec::with_capacity(2);
+        if phase.covered_ms > 0.0 {
+            operations.push(TimingOperationEvidence::new(
+                name,
+                phase.covered_ms,
+                Some(phase.energy_wms),
+                TimingEvidenceSource::Silicon,
+            )?);
+        }
+        if phase.uncovered_ms > 0.0 {
+            // Distinct names preserve uncovered latency through name folding.
+            // Subtracting covered from a rounded total can move the 90% gate.
+            operations.push(TimingOperationEvidence::new(
+                format!("{name}_uncovered"),
+                phase.uncovered_ms,
+                None,
+                TimingEvidenceSource::Silicon,
+            )?);
+        }
+        if !operations.is_empty() {
+            evidence.push((
+                Arc::new(ValidatedTimingPhase::from_operations(operations)?),
+                prefill,
+            ));
+        }
+    }
+    Ok(evidence)
 }
 
 /// Past KV tokens of a decode step, excluding each request's current token.
@@ -2189,7 +2299,7 @@ impl TimingModel for AicTimingModel {
         let batch_size = checked_u32(batch_size, "prefill batch size")?;
         let total_prefill_tokens = checked_u32(new_tokens, "total prefill tokens")?;
         let total_kv_read_tokens = checked_u32(prefix_tokens, "total prefill KV tokens")?;
-        if let Some(model) = &self.diagnostic_model {
+        if let Some(model) = self.fpm_evidence_model() {
             return self.record_fpm_estimate(
                 (
                     FpmEvidencePhase::Prefill,
@@ -2245,7 +2355,7 @@ impl TimingModel for AicTimingModel {
             let batch_size = checked_u32(batch_size, "decode batch size")?;
             let total_past_kv_tokens = checked_u32(total_past_kv_tokens, "total past KV tokens")?;
             // The detailed estimate applies the same correction itself.
-            if let Some(model) = &self.diagnostic_model {
+            if let Some(model) = self.fpm_evidence_model() {
                 let estimate =
                     model.estimate_forward_pass_detailed(&[crate::ForwardPassMetrics {
                         scheduled_requests: crate::ScheduledRequestMetrics {
@@ -2330,7 +2440,7 @@ impl TimingModel for AicTimingModel {
         // The decode share comes first: an engine without the composition
         // returns `None` before any lookup, so the scheduler's separate
         // prefill is never looked up twice.
-        if let Some(model) = &self.diagnostic_model {
+        if let Some(model) = self.fpm_evidence_model() {
             let Some(decode) = model.mixed_decode_detailed_total(decode_batch, decode_kv_tokens)?
             else {
                 return Ok(None);
@@ -2386,8 +2496,7 @@ impl TimingModel for AicTimingModel {
     }
 
     fn evidence_summary(&self) -> Option<TimingEvidenceSummary> {
-        // Whole-model FPM, regression and learned estimators are latency-only.
-        if self.use_fpm_decode_totals || self.is_fitted() {
+        if (self.use_fpm_decode_totals && !self.fpm_power) || self.is_fitted() {
             return None;
         }
         self.evidence
@@ -2396,6 +2505,7 @@ impl TimingModel for AicTimingModel {
             .map(|evidence| evidence.snapshot())
     }
 
+    /// Time and source diagnostics use query history. Power uses the component accumulator.
     fn fpm_evidence_summary(&self) -> Option<TimingEvidenceSummary> {
         if !self.use_fpm_decode_totals || self.diagnostic_model.is_none() {
             return None;
@@ -4063,11 +4173,11 @@ fn replay_timing_evidence_with_fpm(
 ) -> Result<Option<TimingEvidenceSummary>> {
     let mut combined = TimingEvidenceSummary::default();
     for source in sources {
-        let Some(summary) = source.timing.evidence_summary().or_else(|| {
-            include_fpm
-                .then(|| source.timing.fpm_evidence_summary())
-                .flatten()
-        }) else {
+        let Some(summary) = include_fpm
+            .then(|| source.timing.fpm_evidence_summary())
+            .flatten()
+            .or_else(|| source.timing.evidence_summary())
+        else {
             return Ok(None);
         };
         combined.prefill.try_accumulate(scale_power_phase(
@@ -4932,7 +5042,7 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
             replay_timing_evidence(&power_sources)?,
             Some(concat!(
                 "timing provider does not expose typed operation energy evidence; ",
-                "whole-model FPM and latency-only providers are unsupported"
+                "the resolved timing provider or FPM dataset has no supported power path"
             )),
         )
     } else {
@@ -6587,6 +6697,7 @@ mod tests {
             decoder_replay: false,
             phase_provider: AicPhaseProvider::Python,
             use_fpm_decode_totals,
+            fpm_power: false,
             fpm_decode_kv_ceiling: None,
             evidence: Mutex::new(TimingEvidenceAccumulator::default()),
             fpm_evidence: Mutex::default(),
@@ -8814,6 +8925,55 @@ mod tests {
     }
 
     #[test]
+    fn fpm_rank_power_preserves_coverage_boundary() {
+        // Hand oracle: 0.27 ms covered + 0.03 ms uncovered is exactly 90%.
+        // Decreasing only the covered duration by one ULP must withhold watts.
+        for covered_ms in [0.27_f64, 0.27_f64.next_down()] {
+            for prefill in [true, false] {
+                for missing_energy in [None, Some(0.0)] {
+                    let ranks = [(covered_ms, Some(135.0)), (0.03, missing_energy)]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(rank, (latency_ms, energy))| crate::FpmRankEstimate {
+                            rank,
+                            latency_ms,
+                            prefill_ms: prefill.then_some(latency_ms),
+                            decode_ms: (!prefill).then_some(latency_ms),
+                            prefill_energy_wms: prefill.then_some(energy).flatten(),
+                            decode_energy_wms: (!prefill).then_some(energy).flatten(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let estimate = crate::ForwardPassEstimate {
+                        unavailable_reason: None,
+                        latency_ms: Some(0.27),
+                        native_latency_ms: Some(0.27),
+                        correction_factor: None,
+                        max_rank: Some(0),
+                        ranks,
+                    };
+                    let evidence = fpm_rank_evidence(&estimate).unwrap();
+                    let mut accumulated = TimingEvidenceAccumulator::default();
+                    for _ in 0..2 {
+                        for (phase, prefill) in &evidence {
+                            accumulated.record(phase, *prefill).unwrap();
+                        }
+                        let stats = replay_power_stats(&accumulated.snapshot()).unwrap();
+                        if covered_ms == 0.27 {
+                            assert_eq!(stats.coverage(), 0.9);
+                            // 135 W-ms / 0.30 ms = 450 W per invocation.
+                            assert!(close(stats.power_w().unwrap(), 450.0));
+                        } else {
+                            assert!(stats.coverage() < 0.9);
+                            assert_eq!(stats.power_w(), None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn replay_power_matches_shared_contract_fixtures() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/power-contract-v1.json"
@@ -9756,6 +9916,100 @@ mod tests {
             timing
         };
         (timing(), with_iteration_pricing(timing(), model))
+    }
+
+    #[test]
+    fn fpm_replay_powers_components_and_weights_active_ranks_on_every_execution() {
+        use crate::perf_database::fpm_forward::{
+            FPM_FORWARD_POWER_MEASUREMENT_POLICY,
+            tests::{PowerCell, RowSpec},
+        };
+        use crate::perfmodel::engine::runtime::tests::build_fpm_engine_with_rows;
+
+        pyo3::prepare_freethreaded_python();
+        for baseline_power in [None, Some(400.0)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let row =
+                |workload_kind, total_prefill_tokens, total_kv_read_tokens, latency_ms, power| {
+                    RowSpec {
+                        workload_kind,
+                        batch_size: 1,
+                        total_prefill_tokens,
+                        total_kv_read_tokens,
+                        latency_ms,
+                        measurement: Some((FPM_FORWARD_POWER_MEASUREMENT_POLICY, 1)),
+                        power_w: Some(PowerCell::Double(power)),
+                        ..RowSpec::default()
+                    }
+                };
+            let rows = [
+                row("prefill", 8, 0, 100.0, Some(500.0)),
+                row("prefill", 9, 0, 100.0, Some(500.0)),
+                row("decode", 0, 4, 2.0, baseline_power),
+                row("decode", 0, 12, 4.0, Some(500.0)),
+            ];
+            let native = Arc::new(build_fpm_engine_with_rows(tmp.path(), &rows).unwrap());
+            assert!(native.supports_fpm_power().unwrap());
+            let model = Arc::new(ForwardPassPerfModel::from_engine(
+                Arc::clone(&native),
+                crate::ForwardPassPerfOptions::default(),
+            ));
+            let marginal_wms = if baseline_power.is_some() {
+                1200.0
+            } else {
+                0.0
+            };
+            let (prefill, _, decode) = native
+                .mixed_step_breakdown_per_op(8, 1, 8, 6, 0, 1.0, 1.0)
+                .unwrap();
+            assert_eq!((prefill[0].1, prefill[0].2), (100.0, 50_000.0));
+            assert_eq!((decode[0].1, decode[0].2), (2.0, marginal_wms));
+
+            for capture in [false, true] {
+                let (mut phase, mut timing) = fpm_timing_pair(&model);
+                phase.fpm_power = true;
+                timing.fpm_power = true;
+                timing.diagnostic_model = capture.then(|| Arc::clone(&model));
+                let mixed = mixed_work(prefill_work(0, 1, 8, 0), decode_work(0, 1, 13, 1024));
+                let pure_decode = decode_work(1, 1, 13, 1024);
+                for _ in 0..2 {
+                    assert_eq!(
+                        iteration_ms(&timing, &[mixed.clone(), pure_decode.clone()]),
+                        102.0
+                    );
+                }
+                let summary = timing.evidence_summary().unwrap();
+                let stats = replay_power_stats(&summary).unwrap();
+                assert_eq!(summary.prefill.latency_ms, 200.0);
+                assert_eq!(summary.decode.latency_ms, 12.0);
+                let covered_ms = if baseline_power.is_some() {
+                    106.0
+                } else {
+                    104.0
+                };
+                assert!(close(stats.coverage(), covered_ms / 106.0));
+                assert!(close(
+                    stats.power_w().unwrap(),
+                    (52_000.0 + marginal_wms) / 106.0
+                ));
+
+                assert_eq!(phase.predict_prefill_totals_ms(1, 8, 0).unwrap(), 100.0);
+                assert_eq!(phase.predict_decode_ms(1, 13, 13, 1024).unwrap(), 4.0);
+                let pass = phase
+                    .predict_mixed_pass_ms(MIXED_FPM_PREFILL, 1, 13, 13, 1024)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!((pass.prefill_ms, pass.decode_ms), (100.0, 2.0));
+                assert_eq!(
+                    phase.evidence_summary().unwrap().prefill.energy_wms,
+                    Some(100_000.0)
+                );
+                assert_eq!(
+                    phase.evidence_summary().unwrap().decode.energy_wms,
+                    Some(2000.0 + marginal_wms)
+                );
+            }
+        }
     }
 
     fn fpm_records(phase: &TimingPhaseEvidence) -> Vec<crate::FpmEstimateEvidence> {
