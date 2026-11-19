@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from AISim FPM Gym; see README.md for pinned source and modifications.
 
-"""Pinned, hash-verified access to the AISimulate FPM Hugging Face dataset."""
+"""Pinned, hash-verified access to the AISim FPM Hugging Face dataset."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
@@ -16,6 +17,7 @@ from typing import Any, Literal
 from urllib.parse import quote
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi, snapshot_download
 
@@ -32,6 +34,7 @@ from scripts.fpm_accuracy.hf.models import (
     OrderingKind,
 )
 from scripts.fpm_accuracy.hf.overrides import HfCaseOverride, HfOverrides, load_overrides
+from scripts.fpm_accuracy.hf.parquet import validate_collection_manifest
 from scripts.fpm_accuracy.hf.protocols import (
     SUPPORTED_EVIDENCE_FORMAT_IDS,
     ParsedObservation,
@@ -49,7 +52,9 @@ _FPM_ROLES = frozenset({"primary", "comparator", "reference", "historical", "qua
 _FPM_PHASES = frozenset({"prefill", "decode"})
 _SNAPSHOT_STATUSES = frozenset({"current", "historical"})
 _FPM_SCHEMA_NAMES = frozenset({"aic_fpm_forward_perf", "fpm_forward_perf"})
-_FPM_SCHEMA_VERSIONS = frozenset({6, 7})
+# Schema 8 adds per-row power_w and keeps the v7 execution identity.
+_FPM_SCHEMA_VERSIONS = frozenset({6, 7, 8})
+_FPM_POWER_MEASUREMENT_POLICY = "dynamo_native_single_sample_power_window_v1"
 _FPM_V7_SELECTOR_FIELDS = frozenset(
     {
         "gemm_quant_mode",
@@ -65,6 +70,17 @@ _FPM_V7_SELECTOR_FIELDS = frozenset(
         "input_modality",
         "engram_residency",
         "fmha_resolution",
+    }
+)
+_FPM_V7_OPTIONAL_SELECTOR_FIELDS = frozenset(
+    {
+        "measurement_policy",
+        "measurement_repeats",
+        "warmup_repeats",
+        "state_protocol",
+        "timing_boundary",
+        "sglang_allocator_max_split_size_mb",
+        "sglang_allocator_policy_sha256",
     }
 )
 _FPM_CONFIGURATION_FIELDS = (
@@ -107,7 +123,7 @@ class HfDataset:
         self._overrides = overrides
         self._overrides_sha256 = overrides_sha256
         self._index = self._read_json("catalog/index.json")
-        if self._index.get("catalog_version") != 5:
+        if self._index.get("catalog_version") not in (5, 6):
             raise DataError(f"unsupported HF catalog version: {self._index.get('catalog_version')!r}")
         if self._index.get("dataset_id") != repo_id:
             raise DataError(
@@ -338,6 +354,7 @@ class HfDataset:
             parser_policy_id=parser_policy_id,
             warnings=tuple(dict.fromkeys(warnings)),
             issues=parsed.issues,
+            collection_runs=tuple(manifest.get("collection_runs", ())),
         )
 
     def _case_id(
@@ -393,7 +410,7 @@ class HfDataset:
 
     def _load_configuration(self, manifest_path: str) -> ConfigurationSnapshot:
         manifest = self._read_json(manifest_path)
-        if manifest.get("manifest_version") != 3:
+        if manifest.get("manifest_version") not in (3, 4):
             raise DataError(f"unsupported configuration manifest version in {manifest_path}")
         configuration_path = _required_str(manifest, "configuration_path", manifest_path)
         snapshot_id = _required_str(manifest, "snapshot_id", manifest_path)
@@ -491,7 +508,7 @@ class HfDataset:
             expected_sha256=configuration.measurements.manifest_sha256,
         )
         expected = {
-            "manifest_version": 4,
+            "manifest_version": manifest.get("manifest_version") if manifest.get("manifest_version") in (4, 5) else 4,
             "measurement_artifact_id": configuration.measurements.artifact_id,
             "measurement_protocol_id": configuration.measurements.protocol_id,
             "evidence_format_id": configuration.measurements.evidence_format_id,
@@ -516,6 +533,8 @@ class HfDataset:
                 f"measurement manifest {configuration.measurements.manifest_path} file count does not match "
                 f"the configuration manifest"
             )
+        if manifest["manifest_version"] == 5:
+            validate_collection_manifest(manifest)
         return manifest
 
     def _measurement_files(
@@ -588,6 +607,11 @@ class HfDataset:
                     source_path=_optional_str(value.get("source_path")),
                     source_sha256=source_sha256,
                     derived=derived,
+                    storage_format=value.get("format"),
+                    storage_schema=value.get("storage_schema"),
+                    logical_row_count=value.get("logical_row_count"),
+                    source_layout=value.get("source_layout"),
+                    ordering_index=value.get("ordering_index"),
                     representation=representation,
                     iteration_count=iteration_count,
                     rank_record_count=rank_record_count,
@@ -696,6 +720,16 @@ class HfDataset:
             or metadata.get("schema_version") not in _FPM_SCHEMA_VERSIONS
         ):
             raise DataError(f"FPM sidecar {artifact.metadata_path} declares an unsupported schema")
+        has_power = metadata["schema_version"] == 8
+        if has_power and (
+            configuration.framework != "vllm"
+            or metadata.get("backend") != "vllm"
+            or metadata.get("measurement_policy") != _FPM_POWER_MEASUREMENT_POLICY
+        ):
+            raise DataError(
+                f"FPM sidecar {artifact.metadata_path} schema 8 requires vLLM "
+                f"measurement_policy={_FPM_POWER_MEASUREMENT_POLICY!r}"
+            )
         expected_identity = _configuration_identity(configuration)
         selector = metadata.get("configuration_selector")
         if not isinstance(selector, Mapping):
@@ -704,8 +738,8 @@ class HfDataset:
         selector = {"dcp": 1, **selector}
         selector_fields = set(selector)
         expected_fields = set(expected_identity)
-        if metadata["schema_version"] == 7:
-            expected_fields |= _FPM_V7_SELECTOR_FIELDS
+        if metadata["schema_version"] >= 7:
+            expected_fields |= _FPM_V7_SELECTOR_FIELDS | (_FPM_V7_OPTIONAL_SELECTOR_FIELDS & selector_fields)
         if selector_fields != expected_fields:
             missing = sorted(expected_fields - selector_fields)
             unknown = sorted(selector_fields - expected_fields)
@@ -721,11 +755,19 @@ class HfDataset:
         if mismatches:
             raise DataError(f"FPM sidecar {artifact.metadata_path} selects a different configuration: {mismatches}")
         parquet_identity = dict(expected_identity)
-        if metadata["schema_version"] == 7:
-            for field in _FPM_V7_SELECTOR_FIELDS:
+        if metadata["schema_version"] >= 7:
+            execution_fields = expected_fields - set(expected_identity)
+            for field in execution_fields:
                 value = selector[field]
                 if field in {"enable_wideep", "enable_eplb"}:
                     valid = type(value) is bool
+                elif has_power and field == "measurement_policy":
+                    valid = value == _FPM_POWER_MEASUREMENT_POLICY
+                elif field in {"measurement_repeats", "warmup_repeats", "sglang_allocator_max_split_size_mb"}:
+                    minimum = 0 if field == "warmup_repeats" else 1
+                    valid = type(value) is int and value >= minimum
+                elif field == "sglang_allocator_policy_sha256":
+                    valid = isinstance(value, str) and _SHA256.fullmatch(value) is not None
                 elif field == "model_config_sha256":
                     # Empty is the producer's legacy model-config identity.
                     valid = isinstance(value, str) and (value == "" or _SHA256.fullmatch(value) is not None)
@@ -736,7 +778,10 @@ class HfDataset:
             # Check pair consistency only: these values are not an authoritative
             # configuration-to-execution binding. Native staging rejects every
             # v7 pair, even if all rows agree, until that binding is available.
-            parquet_identity.update({field: selector[field] for field in _FPM_V7_SELECTOR_FIELDS})
+            parquet_identity.update({field: selector[field] for field in execution_fields})
+        if has_power:
+            # Bind every row even when the selector omits this optional field.
+            parquet_identity["measurement_policy"] = _FPM_POWER_MEASUREMENT_POLICY
         try:
             parquet = pq.ParquetFile(artifact.local_path)
             physical_rows = parquet.metadata.num_rows
@@ -755,8 +800,12 @@ class HfDataset:
                 f"selected FPM Parquet {artifact.path} is missing configuration identity columns: "
                 f"{missing_identity_fields}"
             )
+        if has_power and (
+            "power_w" not in parquet_fields or parquet.schema_arrow.field("power_w").type != pa.float64()
+        ):
+            raise DataError(f"selected FPM Parquet {artifact.path} schema 8 requires a DOUBLE power_w column")
         try:
-            identity_table = parquet.read(columns=list(parquet_identity))
+            identity_table = parquet.read(columns=[*parquet_identity, *(["power_w"] if has_power else [])])
         except (OSError, pa.ArrowException) as exc:
             raise DataError(f"cannot read selected FPM Parquet identity columns {artifact.path}: {exc}") from exc
         parquet_mismatches: dict[str, list[Any]] = {}
@@ -770,6 +819,14 @@ class HfDataset:
                 f"selected FPM Parquet {artifact.path} contains rows for a different configuration: "
                 f"{parquet_mismatches}"
             )
+        if has_power:
+            power = identity_table["power_w"]
+            invalid_power = pc.or_(pc.invert(pc.is_finite(power)), pc.less_equal(power, 0.0))
+            # Arrow reductions skip nulls: null means unknown measured power.
+            if pc.any(invalid_power).as_py():
+                raise DataError(
+                    f"selected FPM Parquet {artifact.path} power_w must be null or finite and greater than zero"
+                )
 
     def _select_configuration(self, configuration_path: str, snapshot_id: str | None) -> ConfigurationSnapshot:
         snapshots = self.configurations()
@@ -804,7 +861,13 @@ class HfDataset:
                 tuple(
                     sorted(
                         observations,
-                        key=lambda item: (item.chronology_key, item.source_file.path, item.source_row),
+                        key=lambda item: (
+                            item.chronology_key,
+                            item.source_file.ordering_index
+                            if item.source_file.ordering_index is not None
+                            else item.source_file.path,
+                            item.source_row,
+                        ),
                     )
                 ),
                 OrderingKind.CHRONOLOGICAL,
@@ -819,7 +882,13 @@ class HfDataset:
                 tuple(
                     sorted(
                         observations,
-                        key=lambda item: (item.chronology_key, item.source_file.path, item.source_row),
+                        key=lambda item: (
+                            item.chronology_key,
+                            item.source_file.ordering_index
+                            if item.source_file.ordering_index is not None
+                            else item.source_file.path,
+                            item.source_row,
+                        ),
                     )
                 ),
                 OrderingKind.CHRONOLOGICAL,
@@ -835,6 +904,17 @@ class HfDataset:
         result: list[MeasurementObservation] = []
         seen: set[str] = set()
         for order, parsed in enumerate(observations):
+            event_time_ms = None
+            if parsed.chronology_key is not None:
+                if not parsed.chronology_key:
+                    raise DataError("measurement chronology requires a normalized event timestamp")
+                event_time_ms = parsed.chronology_key[0]
+                if (
+                    type(event_time_ms) not in (int, float)
+                    or event_time_ms < 0
+                    or (isinstance(event_time_ms, float) and not math.isfinite(event_time_ms))
+                ):
+                    raise DataError("normalized measurement event_time_ms must be finite and non-negative")
             identity = {
                 "configuration_id": configuration_id,
                 "source_file_id": parsed.source_file.measurement_file_id,
@@ -867,6 +947,7 @@ class HfDataset:
                     source_row=parsed.source_row,
                     iteration=parsed.iteration,
                     event_time=parsed.event_time,
+                    event_time_ms=event_time_ms,
                 )
             )
         return tuple(result)
