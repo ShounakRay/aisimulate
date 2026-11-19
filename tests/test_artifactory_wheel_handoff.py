@@ -368,7 +368,9 @@ def test_wheel_handoffs_require_internal_containerized_runners():
             )
             if not runners or not runners <= internal_runners:
                 violations.append(f"{path.name}:{job_name} lacks an internal Artifactory runner")
-            if not job.get("container", {}).get("image"):
+            container = job.get("container") or {}
+            image = container if isinstance(container, str) else container.get("image")
+            if not image:
                 violations.append(f"{path.name}:{job_name} lacks the required ARC job container")
     assert not violations, "\n".join(violations)
 
